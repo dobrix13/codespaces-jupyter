@@ -239,6 +239,8 @@ class SmartMirror:
     _persistent_osc: KuramotoOscillator | None = field(init=False, default=None)
     _lexicon: object = field(init=False, default=None)  # PhaseLexicon | None
     interaction_count: int = field(init=False, default=0)
+    context_window: int = 13              # Pēdējo jautājumu skaits atmiņā
+    _context_buffer: list = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         """Inicializē persistento oscilatoru, atmiņu un leksikonu."""
@@ -471,9 +473,24 @@ class SmartMirror:
         else:
             init_theta = self.encoder.text_to_init_phases(text, n_oscillators=n_osc)
 
+        # ── 2b. Konteksta logs — pēdējo sync_theta stāvokļu ietekme ─
+        if self._context_buffer:
+            _ctx_z = np.zeros(n_osc, dtype=complex)
+            _ctx_decay = 0.82
+            for _k, _past in enumerate(reversed(self._context_buffer)):
+                _ctx_z += np.exp(1j * np.asarray(_past, dtype=np.float64)) * (_ctx_decay ** (_k + 1))
+            z_sum = z_sum + 0.28 * _ctx_z
+            if np.any(np.abs(z_sum) > 0):
+                init_theta = np.angle(z_sum) % (2 * np.pi)
+
         # ── 3. Sinhronizācija ─────────────────────────────
         sync_theta, R, final_q, osc = self._synchronize(init_theta)
         self._log(f"Sinhronizācija: R={R:.4f}, Q_joy={final_q:.4f}")
+
+        # Atjaunina konteksta buferi
+        self._context_buffer.append(sync_theta.copy())
+        if len(self._context_buffer) > self.context_window:
+            self._context_buffer.pop(0)
 
         # ── 4. MĀCĪŠANĀS — atjaunina K_matrix ────────────
         if self.enable_learning and final_q > 0:
@@ -481,7 +498,7 @@ class SmartMirror:
 
         # ── 5. Dekodēšana — leksikons vai burtu mantra ────
         if self.use_lexicon and self._lexicon is not None and len(self._lexicon) > 0:
-            oracle_words = self._lexicon.find_closest(sync_theta, top_k=3)
+            oracle_words = self._lexicon.find_closest_weighted(sync_theta, top_k=3, q_joy=final_q)
             self._log(f"Orakuls: {[w for w,_ in oracle_words]}")
             return self._oracle_response(oracle_words, R, final_q)
         else:

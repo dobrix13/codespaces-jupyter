@@ -37,6 +37,38 @@ if _this_dir not in sys.path:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  VĀRDU SVĀRS UN DAUDZLĮMEṆU REZONANSES PARAMETRI
+# ═══════════════════════════════════════════════════════════════
+
+# Cik daudz KDTree kandidāti tiek ņemti pirms pārkārtošanas
+_CANDIDATE_FACTOR: int   = 30
+
+# Biežuma sods: 0=nav sods, 1=rets vārds saņem pilnu sodu
+_FREQ_PENALTY: float     = 0.45
+
+# Bonuss par piederību "pareizajai" noskaņai
+_BIAS_STRENGTH: float    = 0.35
+
+# Paradoksa / Joka vārdi — aktivizējas, ja Q_joy < -0.03
+_PARADOX_SEEDS: frozenset = frozenset({
+    "joks", "paradokss", "ilūzija", "ēna", "tukšums",
+    "apziņa", "ironija", "absurds", "brīnums", "mīkla",
+    "klusums", "noslēpums", "haoss", "dualitāte", "spēle",
+    "atspoģojums", "atklājums", "pārsteidziens", "iespaids",
+    "rītausma", "nocīņa", "maldināšana", "slēpt",
+})
+
+# Zelta / Harmonijas vārdi — aktivizējas, ja Q_joy >= 0
+_GOLDEN_SEEDS: frozenset = frozenset({
+    "saule", "gaisma", "miers", "mīlestība", "harmonija",
+    "sirds", "dvēsele", "gudrība", "patiesība", "vienotība",
+    "prieks", "cerība", "brīvība", "skaistums", "elpa",
+    "gara", "rīts", "saules", "mīlotājais", "skābiens",
+    "maigi", "skaidrība", "pilnums", "dzīsma", "dzīve",
+})
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PALĪGFUNKCIJAS — fāžu ↔ Eiklīda telpa
 # ═══════════════════════════════════════════════════════════════
 
@@ -81,6 +113,7 @@ class FastPhaseLexicon:
         self,
         words: list[str],
         phases_matrix: np.ndarray,
+        freq_ranks: "np.ndarray | None" = None,
     ) -> None:
         """
         Inicializē leksikonu un uzbūvē cKDTree.
@@ -89,9 +122,18 @@ class FastPhaseLexicon:
         ---------
         words         : N vārdi
         phases_matrix : (N, 5) θ_final masīvs
+        freq_ranks    : (N,) normalizēti biežuma rangi [0,1]
+                        0=visbiežākais, 1=reti sastopams
+                        None → vienādi svari 0.5
         """
         self.words = words
         self.phases_matrix = phases_matrix  # (N, 5)
+
+        # Biežuma rangi — ja nav, piešķir vidējo vērtību
+        if freq_ranks is not None:
+            self.freq_ranks = np.asarray(freq_ranks, dtype=np.float64)
+        else:
+            self.freq_ranks = np.full(len(words), 0.5, dtype=np.float64)
 
         # Pārveido uz 10D Eiklīda telpu
         self._embedded = phases_to_euclidean(phases_matrix)  # (N, 10)
@@ -132,7 +174,30 @@ class FastPhaseLexicon:
         print(f"[FastLexicon] Ielādēts: {filepath}")
         print(f"             {len(words)} vārdi, matrica {phases_matrix.shape}")
 
-        return cls(words=words, phases_matrix=phases_matrix)
+        # ── Biežuma rangu ielāde no latvian_words.txt ──────────────
+        freq_ranks: "np.ndarray | None" = None
+        for candidate in [
+            "latvian_words.txt",
+            os.path.join(os.path.dirname(filepath), "..", "latvian_words.txt"),
+        ]:
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, encoding="utf-8", errors="replace") as fh:
+                        freq_lines = [
+                            ln.strip().split()[0]
+                            for ln in fh if ln.strip() and not ln.startswith("#")
+                        ]
+                    n_freq = len(freq_lines)
+                    rank_dict = {w: i / max(n_freq - 1, 1) for i, w in enumerate(freq_lines)}
+                    freq_ranks = np.array(
+                        [rank_dict.get(w, 0.75) for w in words], dtype=np.float64
+                    )
+                    print(f"[FastLexicon] Biežuma rangi: {n_freq} vārdi no '{candidate}'")
+                except Exception:
+                    pass
+                break
+
+        return cls(words=words, phases_matrix=phases_matrix, freq_ranks=freq_ranks)
 
     # ── Meklēšana ────────────────────────────────────────────────
 
@@ -178,6 +243,63 @@ class FastPhaseLexicon:
             indices = [int(indices)]
 
         return [(self.words[int(i)], float(d)) for i, d in zip(indices, distances)]
+
+    def find_closest_weighted(
+        self,
+        target_theta: np.ndarray,
+        top_k: int = 3,
+        q_joy: float = 0.0,
+    ) -> list[tuple[str, float]]:
+        """
+        Atrod top_k vārdus, svērtos pēc fāžu tuvības + biežuma + Q_joy noskaņas.
+
+        Stratēģija:
+        1. KDTree iegūst top_k * CANDIDATE_FACTOR kandidātus
+        2. Katrs kandidāts saņem svērto punktu:
+               combined = distance + FREQ_PENALTY * freq_rank
+                        - BIAS_STRENGTH  (ja vārds atbilst Q_joy noskaņai)
+        3. Atgriež top_k pēc kombinētā punkta
+
+        Parametri
+        ---------
+        target_theta : (5,) fāžu vektors
+        top_k        : cik vārdu atgriezt
+        q_joy        : pašreizējā K-matricas Q_joy vērtība
+                       < -0.03 → paradoksa noskaņa
+                       ≥  0.0  → harmonijas noskaņa
+        """
+        target_theta = np.asarray(target_theta, dtype=np.float64).ravel()
+        if target_theta.shape[0] != self.phases_matrix.shape[1]:
+            raise ValueError(
+                f"target_theta dimensija ({target_theta.shape[0]}) != "
+                f"leksikona dimensija ({self.phases_matrix.shape[1]})"
+            )
+
+        n_candidates = min(top_k * _CANDIDATE_FACTOR, len(self.words))
+        query_point = phases_to_euclidean(target_theta)
+        distances, indices = self._tree.query(query_point, k=n_candidates)
+
+        if np.ndim(distances) == 0:
+            distances = [float(distances)]
+            indices   = [int(indices)]
+
+        is_joks     = q_joy < -0.03
+        is_harmonija = q_joy >= 0.0
+
+        scored: list[tuple[float, str, float]] = []
+        for d, i in zip(distances, indices):
+            i = int(i); d = float(d)
+            word = self.words[i]
+            freq_penalty = float(self.freq_ranks[i]) * _FREQ_PENALTY
+            bias = 0.0
+            if is_joks     and word in _PARADOX_SEEDS:
+                bias = -_BIAS_STRENGTH
+            elif is_harmonija and word in _GOLDEN_SEEDS:
+                bias = -_BIAS_STRENGTH
+            scored.append((d + freq_penalty + bias, word, d))
+
+        scored.sort(key=lambda x: x[0])
+        return [(w, d) for _, w, d in scored[:top_k]]
 
     def get_word_phase(self, word: str) -> "np.ndarray | None":
         """
