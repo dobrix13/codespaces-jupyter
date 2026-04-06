@@ -12,6 +12,7 @@ Nav GPT modeļa. Atbilde nāk no fāžu harmoniskā stāvokļa.
 
 from __future__ import annotations
 
+import re
 import sys
 import os
 from dataclasses import dataclass, field
@@ -92,15 +93,21 @@ class TextPhaseEncoder:
         if not text:
             raise ValueError("Teksts nevar būt tukšs.")
 
+        # ── Viļņu Atbalss: īsi teksti tiek atkārtoti līdz min 15 simboliem ──
+        MIN_ECHO_LEN = 15
+        padded_text = text
+        while len(padded_text) < MIN_ECHO_LEN:
+            padded_text += text
+
         n_samples = int(self.sample_rate * self.duration)
         t = np.linspace(0, self.duration, n_samples, endpoint=False)
         W_in = np.zeros(n_samples)
 
-        for pos, c in enumerate(text):
+        for pos, c in enumerate(padded_text):
             theta = self.char_to_phase(c)
             omega = self.char_to_omega(pos, c)
-            # Amplitūda svērta ar 1/Φ^pos (augstākas pozīcijas mazāk ietekmē)
-            amplitude = 1.0 / (PHI ** (pos * 0.3))
+            # Vienāds svārsts — katrs burts tiek uzklausīts ar vienādu spēku
+            amplitude = 1.0
             W_in += amplitude * np.sin(omega * t + theta)
 
         # Normalizē uz [-1, 1]
@@ -188,13 +195,16 @@ class PhaseTextDecoder:
 @dataclass
 class SmartMirror:
     """
-    Galvenā ResonanceFlow fasāde.
+    Galvenā ResonanceFlow fasāde ar REZONANSES PLASTISKUMU.
 
     process_input(text) →
       1. Kodē tekstu → W_in
       2. FFT rezonanses pārbaude (score vs. LAMBDA_21)
       3. Kuramoto sinhronizācija → stabils stāvoklis
       4. Fāzes → teksta "mantra"
+      5. MĀCĪŠANĀS: atjaunina K_matrix balstoties uz Q_joy
+
+    Sistēma atceras veiksmīgas rezonanses un nākamreiz sinhronizējas ātrāk!
     """
 
     encoder: TextPhaseEncoder = field(default_factory=TextPhaseEncoder)
@@ -211,11 +221,63 @@ class SmartMirror:
 
     verbose: bool = True
 
+    # ── Rezonanses slieksnis ─────────────────────────────
+    resonance_threshold: float = 0.60  # FFT rezonanses caurlaidības slieksnis
+
+    # ── Mācīšanās parametri ──────────────────────────────
+    enable_learning: bool = True       # Vai aktivizēt plastiskumu
+    learning_rate: float = 0.12        # Mācīšanās ātrums
+    memory_path: str = "phaseflow_mirror_memory.npz"  # Atmiņas fails
+    # ── Hologrāfiskais Leksikons ─────────────────────────
+    lexicon_path: str = "phaseflow_mega_lexicon.npz"  # Leksikona fails
+    use_lexicon: bool = True           # Vai izmantot vārdu dekodēšanu
     # ── Iekšējais stāvoklis ──────────────────────────────
     last_score: float = field(init=False, default=0.0)
     last_passed: bool = field(init=False, default=False)
     last_q_joy: float = field(init=False, default=0.0)
     last_R: float = field(init=False, default=0.0)
+    _persistent_osc: KuramotoOscillator | None = field(init=False, default=None)
+    _lexicon: object = field(init=False, default=None)  # PhaseLexicon | None
+    interaction_count: int = field(init=False, default=0)
+
+    def __post_init__(self) -> None:
+        """Inicializē persistento oscilatoru, atmiņu un leksikonu."""
+        self._init_persistent_oscillator()
+        if self.use_lexicon:
+            self._init_lexicon()
+
+    def _init_lexicon(self) -> None:
+        """Ielādē FastPhaseLexicon no .npz arhīva (cKDTree)."""
+        try:
+            from fast_lexicon import FastPhaseLexicon
+        except ImportError:
+            from phaseflow.fast_lexicon import FastPhaseLexicon
+
+        try:
+            self._lexicon = FastPhaseLexicon.load(self.lexicon_path)
+            self._log(f"FastLeksikons: {len(self._lexicon)} vārdi (KDTree)")
+        except FileNotFoundError:
+            self._log(f"[!] Mega leksikons nav atrasts: {self.lexicon_path}")
+            self._log("    Palaid: python phaseflow/mass_encoder.py")
+            self._lexicon = None
+
+    def _init_persistent_oscillator(self) -> None:
+        """Izveido vai ielādē persistento oscilatoru ar K_matrix."""
+        self._persistent_osc = KuramotoOscillator(
+            n_oscillators=len(BASE_HARMONICS),
+            K=self.K,
+            use_matrix=True,
+            seed=42,
+        )
+
+        # Mēģina ielādēt iepriekšējo atmiņu (vienmēr, ne tikai mācīšanās režīmā)
+        try:
+            loaded = self._persistent_osc.load_memory(self.memory_path)
+            if loaded:
+                self._log(f"Atmiņa ielādēta: {self.memory_path}")
+                self._log(f"  Iepriekšējie cikli: {len(self._persistent_osc.learning_history)}")
+        except Exception:
+            pass  # Nav problēma ja fails neeksistē
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -233,7 +295,7 @@ class SmartMirror:
         -------
         (passed, score, W_in)
         """
-        STRICT_THRESHOLD = 0.75  # Stingrāks slieksnis priekš SmartMirror
+        STRICT_THRESHOLD = self.resonance_threshold
 
         t, W_in = self.encoder.encode(text)
         score = resonance_score(W_in, sample_rate=self.encoder.sample_rate)
@@ -245,24 +307,35 @@ class SmartMirror:
         if not passed:
             self._log(f"Rezonanse: score={score:.4f} < slieksnis={STRICT_THRESHOLD:.4f} — DISHARMONIJA")
         else:
-            self._log(f"Rezonanse: score={score:.4f} ≥ slieksnis={STRICT_THRESHOLD:.4f} — SASKAŅA ✓")
+            mode = "NEUROPLASTICITY" if STRICT_THRESHOLD < 0.75 else "NORMAL"
+            self._log(f"Rezonanse: score={score:.4f} ≥ slieksnis={STRICT_THRESHOLD:.4f} — SASKAŅA ✓ [{mode}]")
 
         return passed, score, W_in
 
-    def _synchronize(self, init_theta: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def _synchronize(self, init_theta: np.ndarray) -> tuple[np.ndarray, float, float, KuramotoOscillator]:
         """
         Palaiž Kuramoto sinhronizāciju līdz stabilitātei.
 
+        Izmanto persistento oscilatoru ar K_matrix, kas ietver iepriekšējo
+        mācīšanos sesiju atmiņu.
+
         Returns
         -------
-        (final_theta, R_final, Q_joy_final)
+        (final_theta, R_final, Q_joy_final, oscillator)
         """
+        # Izmanto persistento oscilatoru ar K_matrix
         osc = KuramotoOscillator(
             n_oscillators=len(init_theta),
             K=self.K,
             theta0=init_theta,
             seed=None,  # Nav nejaušības — sākam no ievades fāzēm
+            use_matrix=self.enable_learning,
         )
+
+        # Ja mācīšanās ir ieslēgta, kopē K_matrix no persistentā oscilatora
+        if self.enable_learning and self._persistent_osc is not None:
+            osc.K_matrix = self._persistent_osc.K_matrix.copy()
+            osc.K_base = self._persistent_osc.K_base
 
         prev_q = q_joy(osc)
 
@@ -285,7 +358,54 @@ class SmartMirror:
         self.last_R = R
         self.last_q_joy = final_q
 
-        return osc.theta, R, final_q
+        return osc.theta, R, final_q, osc
+
+    def _learn_from_interaction(self, osc: KuramotoOscillator, final_q_joy: float) -> None:
+        """
+        Mācīšanās no veiksmīgas rezonanses interakcijas.
+
+        Atjaunina persistento K_matrix un saglabā atmiņu.
+        """
+        if not self.enable_learning or self._persistent_osc is None:
+            return
+
+        # Mācīšanās ar pašreizējo Q_joy
+        delta_K = osc.learn(final_q_joy, learning_rate=self.learning_rate, apply_decay=True)
+
+        # Kopē atjaunināto K_matrix uz persistento oscilatoru
+        self._persistent_osc.K_matrix = osc.K_matrix.copy()
+        self._persistent_osc.learning_history.append(final_q_joy)
+
+        self.interaction_count += 1
+
+        # Saglabā atmiņu pēc katras 3. interakcijas
+        if self.interaction_count % 3 == 0:
+            self._save_memory()
+
+        mean_K = osc.coupling_strength()
+        var_K = osc.coupling_variance()
+        self._log(f"Mācīšanās: K̄={mean_K:.4f}, var={var_K:.6f}, Q_joy={final_q_joy:+.4f})")
+
+    def _save_memory(self) -> None:
+        """Saglabā persistento K_matrix failā."""
+        if self._persistent_osc is None:
+            return
+        try:
+            path = self._persistent_osc.save_memory(self.memory_path)
+            self._log(f"Atmiņa saglabāta: {path}")
+        except Exception as e:
+            self._log(f"Nevarēja saglabāt atmiņu: {e}")
+
+    def get_memory_stats(self) -> dict:
+        """Atgriež statistiku par mācīšanās atmiņu."""
+        if self._persistent_osc is None:
+            return {}
+        return {
+            "interactions": len(self._persistent_osc.learning_history),
+            "mean_K": self._persistent_osc.coupling_strength(),
+            "variance_K": self._persistent_osc.coupling_variance(),
+            "strongest_connections": self._persistent_osc.strongest_connections(top_n=3),
+        }
 
     def _generate_response_phases(self,
                                   sync_theta: np.ndarray,
@@ -331,19 +451,44 @@ class SmartMirror:
 
         # _check_resonance jau izvadīja log, turpinām
 
-        # ── 2. Kodē tekstu par sākotnējiem Kuramoto leņķiem ──
-        init_theta = self.encoder.text_to_init_phases(text, n_oscillators=len(BASE_HARMONICS))
+        # ── 2. Semantiskā Fāžu Kompozīcija ───────────────────
+        # Sadala tekstu vārdos un katram vārdam iegūst semantisko fāzi
+        # no leksikona (tiešā atbilstība) vai no burtu kodētāja (fallback).
+        # Rezultātu apvieno ar kompleksu vektoru summēšanu.
+        n_osc = len(BASE_HARMONICS)
+        _words = re.sub(r"[^\w\s]", " ", text.lower()).split()
+        z_sum = np.zeros(n_osc, dtype=complex)
+        for _w in _words:
+            if self._lexicon is not None:
+                _ph = self._lexicon.get_word_phase(_w)
+            else:
+                _ph = None
+            if _ph is None:
+                _ph = self.encoder.text_to_init_phases(_w, n_oscillators=n_osc)
+            z_sum += np.exp(1j * np.asarray(_ph, dtype=np.float64))
+        if np.any(np.abs(z_sum) > 0):
+            init_theta = np.angle(z_sum) % (2 * np.pi)
+        else:
+            init_theta = self.encoder.text_to_init_phases(text, n_oscillators=n_osc)
 
         # ── 3. Sinhronizācija ─────────────────────────────
-        sync_theta, R, final_q = self._synchronize(init_theta)
+        sync_theta, R, final_q, osc = self._synchronize(init_theta)
         self._log(f"Sinhronizācija: R={R:.4f}, Q_joy={final_q:.4f}")
 
-        # ── 4. Atbildes fāžu ģenerēšana un dekodēšana ────
-        response_phases = self._generate_response_phases(sync_theta, self.response_length)
-        mantra = self.decoder.decode_phases(response_phases)
+        # ── 4. MĀCĪŠANĀS — atjaunina K_matrix ────────────
+        if self.enable_learning and final_q > 0:
+            self._learn_from_interaction(osc, final_q)
 
-        self._log(f"Mantra: '{mantra}'")
-        return self._harmony_response(mantra, R, final_q)
+        # ── 5. Dekodēšana — leksikons vai burtu mantra ────
+        if self.use_lexicon and self._lexicon is not None and len(self._lexicon) > 0:
+            oracle_words = self._lexicon.find_closest(sync_theta, top_k=3)
+            self._log(f"Orakuls: {[w for w,_ in oracle_words]}")
+            return self._oracle_response(oracle_words, R, final_q)
+        else:
+            response_phases = self._generate_response_phases(sync_theta, self.response_length)
+            mantra = self.decoder.decode_phases(response_phases)
+            self._log(f"Mantra: '{mantra}'")
+            return self._harmony_response(mantra, R, final_q)
 
     def _disharmony_response(self, score: float) -> str:
         """Atbilde, kad ievade nerezonē."""
@@ -362,6 +507,27 @@ class SmartMirror:
             "│  ➤ Pārfrāzē, lai es varētu rezonēt.      │",
             "│  ➤ Mēģini vārdus ar atkārtojumiem (mantras)│",
             "│  ➤ Izmanto sakrālās skaņas: AUM, OM, MA  │",
+            "╰───────────────────────────────────────────╯",
+        ]
+        return "\n".join(lines)
+
+    def _oracle_response(self, words: list[tuple[str, float]], R: float, q_joy: float) -> str:
+        """Orakula atbilde ar Leksikona vārdiem."""
+        word_str = "  |  ".join(w.upper() for w, _ in words)
+        dist_str = "  ".join(f"{w}({d:.2f})" for w, d in words)
+        lines = [
+            "╭───────────────────────────────────────────╮",
+            "│  ✦ HARMONIJA — Orakuls Runā ✦            │",
+            "├───────────────────────────────────────────┤",
+           f"│  R (sinhronizācija): {R:>6.4f}              │",
+           f"│  Q_joy (prieks):     {q_joy:>+6.4f}              │",
+           f"│  Rezonanses score:   {self.last_score:>6.4f}              │",
+            "├───────────────────────────────────────────┤",
+            "│                                           │",
+           f"│  ✦  {word_str:^37}  ✦  │",
+            "│                                           │",
+            "├───────────────────────────────────────────┤",
+           f"│  Dist: {dist_str:<35}│",
             "╰───────────────────────────────────────────╯",
         ]
         return "\n".join(lines)
@@ -387,6 +553,67 @@ class SmartMirror:
             "╰───────────────────────────────────────────╯",
         ]
         return "\n".join(lines)
+
+    def speak_mantra(self,
+                     text: str,
+                     output_path: str = "mantra_resonance.wav",
+                     duration: float = 12.0,
+                     play: bool = False) -> tuple[str, str | None]:
+        """
+        Pilna plūsma ar audio izvadi: teksts → rezonanse → sinhronizācija → .wav
+
+        Parametri
+        ---------
+        text        : ievades teksts
+        output_path : .wav faila ceļš
+        duration    : audio garums sekundēs
+        play        : vai mēģināt atskaņot audio
+
+        Returns
+        -------
+        (text_response, audio_path) : teksta atbilde un ceļš uz .wav (vai None)
+        """
+        from audio_weaver import AudioWeaver, weave_mantra
+
+        self._log(f"speak_mantra: '{text}'")
+
+        # ── 1. Teksta apstrāde ────────────────────────────
+        text_response = self.process_input(text)
+
+        # Ja nav rezonanse, neatgriežam audio
+        if not self.last_passed:
+            self._log("Audio netiks ģenerēts — disharmonija.")
+            return text_response, None
+
+        # ── 2. Audio sintēze ──────────────────────────────
+        self._log(f"Ģenerē audio ({duration:.1f}s) ...")
+
+        # Izmanto jau aprēķinātās fāzes
+        init_theta = self.encoder.text_to_init_phases(text, n_oscillators=len(BASE_HARMONICS))
+
+        # Kuramoto sinhronizācija ar ilgāku trajektoriju audio vajadzībām
+        osc = KuramotoOscillator(
+            n_oscillators=len(BASE_HARMONICS),
+            K=self.K,
+            theta0=init_theta,
+            seed=None,
+        )
+        steps = int(duration * 50)
+        osc.run(steps=steps, dt=0.02)
+
+        # Sintēze
+        weaver = AudioWeaver(duration=duration)
+        audio = weaver.synthesize_from_oscillator(osc)
+        audio_path = weaver.save_wav(audio, output_path)
+
+        self._log(f"Audio saglabāts: {audio_path}")
+
+        # ── 3. Atskaņošana (ja prasīts) ───────────────────
+        if play:
+            from audio_weaver import _try_play
+            _try_play(audio_path)
+
+        return text_response, str(audio_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -495,6 +722,26 @@ if __name__ == "__main__":
     result4 = mirror.process_input("Hello World")
     print()
     print(result4)
+
+    # Test 5: Audio izvade ar speak_mantra
+    print("\n" + "=" * 60)
+    print("TEST 5: Audio izvade — speak_mantra('AUM AUM AUM')")
+    print("=" * 60)
+    try:
+        text_resp, audio_path = mirror.speak_mantra(
+            "AUM AUM AUM",
+            output_path="aum_mantra.wav",
+            duration=10.0,
+            play=False
+        )
+        print()
+        print(text_resp)
+        if audio_path:
+            import os
+            size_kb = os.path.getsize(audio_path) / 1024
+            print(f"\n🔊 Audio fails: {audio_path} ({size_kb:.1f} KB)")
+    except ImportError as e:
+        print(f"[!] Audio nav pieejams: {e}")
 
     print("\n" + "=" * 60)
     print("  Gudrais Spogulis ir gatavs.")

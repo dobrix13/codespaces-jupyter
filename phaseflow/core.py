@@ -88,32 +88,49 @@ def normalize_phase(z: np.ndarray) -> np.ndarray:
 @dataclass
 class KuramotoOscillator:
     """
-    N savstarpēji saistītu oscilatoru Kuramoto modelis.
+    N savstarpēji saistītu oscilatoru Kuramoto modelis ar DINAMISKO SAKABES MATRICU.
 
     Dinamika:
-      dθᵢ/dt = ωᵢ + (K / N) · Σⱼ sin(θⱼ − θᵢ)
+      dθᵢ/dt = ωᵢ + (1/N) · Σⱼ K_ij · sin(θⱼ − θᵢ)
+
+    Mācīšanās (Hebbian Phase Plasticity):
+      ΔK_ij = learning_rate · Q_joy · cos(θᵢ − θⱼ)
 
     Parametri
     ---------
     n_oscillators : oscilatoru skaits (pēc noklusējuma = len(BASE_HARMONICS))
-    K             : sakabes koeficients λ_tH — lielāks K → ātrāka sinhronizācija
+    K             : sākotnējā sakabes bāzes vērtība (skalārs vai matrica)
     omega         : dabiskās frekvences ωᵢ; ja None, ģenerē no BASE_HARMONICS
     theta0        : sākotnējie leņķi θᵢ; ja None, izvēlas nejaušus
     seed          : nejaušības sēkla reproducējamībai
+    use_matrix    : vai izmantot K_matrix (True) vai skalāru K (False, atpakaļsaderība)
     """
     n_oscillators: int = len(BASE_HARMONICS)
     K: float = 2.0
     omega: np.ndarray | None = None
     theta0: np.ndarray | None = None
     seed: int | None = 42
+    use_matrix: bool = True  # Jaunā plastiskuma funkcionalitāte
 
     # Iekšējais stāvoklis (inicializēts pēc __post_init__)
     theta: np.ndarray = field(init=False)
     _omega: np.ndarray = field(init=False)
+    K_matrix: np.ndarray = field(init=False)  # Dinamiskā sakabes matrica (N, N)
+    K_base: float = field(init=False)          # Bāzes vērtība decay mehānismam
     history: list[np.ndarray] = field(default_factory=list)
+    learning_history: list[float] = field(default_factory=list)  # Q_joy vēsture mācīšanās laikā
 
     def __post_init__(self) -> None:
         rng = np.random.default_rng(self.seed)
+
+        # Saglabā bāzes K vērtību decay mehānismam
+        self.K_base = self.K
+
+        # Inicializē sakabes matricu K_ij
+        N = self.n_oscillators
+        self.K_matrix = np.full((N, N), self.K, dtype=float)
+        # Diagonālē nav pašsaites
+        np.fill_diagonal(self.K_matrix, 0.0)
 
         # Dabiskās frekvences
         if self.omega is not None:
@@ -129,6 +146,7 @@ class KuramotoOscillator:
             self.theta = rng.uniform(0, 2 * np.pi, self.n_oscillators)
 
         self.history = [self.theta.copy()]
+        self.learning_history = []
 
     # ── Kuramoto labā puse ─────────────────────
 
@@ -136,12 +154,21 @@ class KuramotoOscillator:
         """
         Aprēķina dθᵢ/dt katram oscilatoram.
 
-        dθᵢ/dt = ωᵢ + (K/N) · Σⱼ sin(θⱼ − θᵢ)
+        Ar matricu: dθᵢ/dt = ωᵢ + (1/N) · Σⱼ K_ij · sin(θⱼ − θᵢ)
+        Bez matricas: dθᵢ/dt = ωᵢ + (K/N) · Σⱼ sin(θⱼ − θᵢ)
         """
         N = self.n_oscillators
-        # Visu pāru starpības matricā (jxī)
+        # Visu pāru starpības matricā: diff[i,j] = θⱼ − θᵢ
         diff = self.theta[np.newaxis, :] - self.theta[:, np.newaxis]  # (N, N)
-        coupling = (self.K / N) * np.sum(np.sin(diff), axis=1)
+
+        if self.use_matrix:
+            # Dinamiskā matrica: katrs pāris ar savu K_ij
+            weighted_sin = self.K_matrix * np.sin(diff)  # (N, N)
+            coupling = (1.0 / N) * np.sum(weighted_sin, axis=1)
+        else:
+            # Atpakaļsaderīgais skalārais režīms
+            coupling = (self.K / N) * np.sum(np.sin(diff), axis=1)
+
         return self._omega + coupling
 
     # ── Integrācija (Runge-Kutta 4) ────────────
@@ -188,11 +215,174 @@ class KuramotoOscillator:
         z = np.mean(np.exp(1j * self.theta))
         return float(np.abs(z)), float(np.angle(z))
 
-    def reset(self, seed: int | None = None) -> None:
+    def reset(self, seed: int | None = None, reset_matrix: bool = False) -> None:
         """Atjauno oscilatoru sākotnējos nejaušos leņķus."""
         rng = np.random.default_rng(seed if seed is not None else self.seed)
         self.theta = rng.uniform(0, 2 * np.pi, self.n_oscillators)
         self.history = [self.theta.copy()]
+
+        if reset_matrix:
+            # Atjauno K_matrix uz bāzes vērtību
+            self.K_matrix = np.full((self.n_oscillators, self.n_oscillators),
+                                     self.K_base, dtype=float)
+            np.fill_diagonal(self.K_matrix, 0.0)
+            self.learning_history = []
+
+    # ── HEBBIAN PHASE LEARNING ─────────────────
+
+    def learn(self,
+              q_joy_value: float,
+              learning_rate: float = 0.1,
+              apply_decay: bool = True) -> np.ndarray:
+        """
+        Rezonanses Plastiskums: Hebbian Phase Learning.
+
+        Mācīšanās noteikums:
+          ΔK_ij = learning_rate · Q_joy · cos(θᵢ − θⱼ)
+
+        Ja oscilatori i un j ir saskaņā (leņķu starpība ≈ 0) un Q_joy > 0,
+        to savstarpējā saite K_ij kļūst stiprāka.
+        Ja Q_joy < 0 (disonanse), saite vājinās.
+
+        Parameters
+        ----------
+        q_joy_value   : pašreizējā Q_joy vērtība
+        learning_rate : mācīšanās ātrums (noklusējums 0.1)
+        apply_decay   : vai pielietot Phi Decay pēc mācīšanās
+
+        Returns
+        -------
+        np.ndarray : ΔK_ij matrica (izmaiņu vizualizācijai)
+        """
+        N = self.n_oscillators
+
+        # Fāžu starpību matrica: diff[i,j] = θᵢ − θⱼ
+        diff = self.theta[:, np.newaxis] - self.theta[np.newaxis, :]  # (N, N)
+
+        # Hebbian noteikums: stiprinām saites starp saskaņotiem oscilatoriem
+        delta_K = learning_rate * q_joy_value * np.cos(diff)
+
+        # Neļauj pašsaitēm mainīties
+        np.fill_diagonal(delta_K, 0.0)
+
+        # Pielieto izmaiņas
+        self.K_matrix += delta_K
+
+        # Nodrošina, ka K_ij ≥ 0 (nav negatīvas saites)
+        self.K_matrix = np.maximum(self.K_matrix, 0.0)
+
+        # Phi Decay — lēns atgriešanās uz bāzes vērtību
+        if apply_decay:
+            self.phi_decay()
+
+        # Saglabā Q_joy vēsturi
+        self.learning_history.append(q_joy_value)
+
+        return delta_K
+
+    def phi_decay(self, decay_power: float = 0.02) -> None:
+        """
+        Zelta proporcijas samazinājums (Phi Decay).
+
+        Pēc katras mācīšanās, K_ij minimāli "atdziest" virzienā uz K_base:
+          K_ij ← K_base + (K_ij - K_base) / φ^decay_power
+
+        Tas novērš bezgalīgu matricas augšanu vai sabrukumu.
+
+        Parameters
+        ----------
+        decay_power : pakāpe, kurā φ tiek celta (mazāks = lēnāks decay)
+        """
+        decay_factor = PHI ** decay_power  # ≈ 1.01 pie 0.02
+
+        # Matrica tuvojas bāzes vērtībai
+        deviation = self.K_matrix - self.K_base
+        self.K_matrix = self.K_base + deviation / decay_factor
+
+        # Diagonāle paliek 0
+        np.fill_diagonal(self.K_matrix, 0.0)
+
+    def coupling_strength(self) -> float:
+        """
+        Atgriež kopējo vidējo sakabes spēku (K_ij vidējais bez diagonāles).
+        """
+        N = self.n_oscillators
+        mask = ~np.eye(N, dtype=bool)
+        return float(np.mean(self.K_matrix[mask]))
+
+    def coupling_variance(self) -> float:
+        """
+        Atgriež K_ij varianci — cik daudz saites atšķiras viena no otras.
+        Augsta variance = sistēma ir "iemācījusies" specifiskas saites.
+        """
+        N = self.n_oscillators
+        mask = ~np.eye(N, dtype=bool)
+        return float(np.var(self.K_matrix[mask]))
+
+    def strongest_connections(self, top_n: int = 5) -> list[tuple[int, int, float]]:
+        """
+        Atgriež top_n stiprākās saites (i, j, K_ij).
+        """
+        N = self.n_oscillators
+        connections = []
+        for i in range(N):
+            for j in range(N):
+                if i != j:
+                    connections.append((i, j, self.K_matrix[i, j]))
+        connections.sort(key=lambda x: -x[2])
+        return connections[:top_n]
+
+    # ── ATMIŅAS SAGLABĀŠANA / IELĀDE ───────────
+
+    def save_memory(self, filepath: str = "phaseflow_memory.npz") -> str:
+        """
+        Saglabā K_matrix un mācīšanās vēsturi failā.
+
+        Returns
+        -------
+        str : pilns ceļš uz saglabāto failu
+        """
+        from pathlib import Path
+        filepath = Path(filepath)
+
+        np.savez(
+            filepath,
+            K_matrix=self.K_matrix,
+            K_base=self.K_base,
+            learning_history=np.array(self.learning_history),
+            n_oscillators=self.n_oscillators,
+        )
+
+        return str(filepath.resolve())
+
+    def load_memory(self, filepath: str = "phaseflow_memory.npz") -> bool:
+        """
+        Ielādē K_matrix no faila.
+
+        Returns
+        -------
+        bool : True ja veiksmīgi ielādēts, False ja fails neeksistē
+        """
+        from pathlib import Path
+        filepath = Path(filepath)
+
+        if not filepath.exists():
+            return False
+
+        data = np.load(filepath)
+
+        # Pārbauda, vai dimensijas sakrīt
+        if data["n_oscillators"] != self.n_oscillators:
+            raise ValueError(
+                f"Nesaderīgas dimensijas: failā {data['n_oscillators']}, "
+                f"oscilatorā {self.n_oscillators}"
+            )
+
+        self.K_matrix = data["K_matrix"]
+        self.K_base = float(data["K_base"])
+        self.learning_history = list(data["learning_history"])
+
+        return True
 
 
 # ─────────────────────────────────────────────
@@ -414,36 +604,153 @@ def plot_fft_resonance(signal: Sequence[float] | np.ndarray,
 
 
 # ─────────────────────────────────────────────
-# ĀTRAIS TESTS
+# ĀTRAIS TESTS — AR REZONANSES PLASTISKUMU
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("── PhaseFlow v1.0 ─────────────────────────")
+    print("═" * 60)
+    print("  PhaseFlow v1.1 — ar Rezonanses Plastiskumu (Hebbian)")
+    print("═" * 60)
     print(f"  φ  (Zelta proporcija)  = {PHI:.8f}")
     print(f"  ψ₄₂ (atsauces fāze)   = {PSI_42:.8f} rad")
     print(f"  λ₂₁ (rezonanses slieksnis) = {LAMBDA_21:.8f}")
     print(f"  Bāzes harmoniku kopums: {BASE_HARMONICS.tolist()}")
+    print()
 
-    phases = harmonic_phases()
-    print(f"\nHarmoniku fāzes (e^{{i·n·ψ₄₂}}):")
-    for n, z in zip(BASE_HARMONICS, phases):
-        print(f"  n={int(n):2d}  →  {z.real:+.4f} + {z.imag:+.4f}i  "
-              f"(|z|={abs(z):.4f}, θ={np.angle(z):.4f} rad)")
+    # ── A) Bāzes tests ar K_matrix ────────────────────────
+    print("▸ A) Kuramoto ar dinamisko K_matrix")
+    print("-" * 50)
 
-    print("\nKuramoto oscilatoru inicializācija (K=2.0) ...")
-    osc = KuramotoOscillator(K=2.0)
+    osc = KuramotoOscillator(K=2.0, use_matrix=True, seed=42)
+    print(f"  Sākotnējais K_matrix vidējais: {osc.coupling_strength():.4f}")
+    print(f"  K_matrix variance: {osc.coupling_variance():.6f}")
+
     R0, Psi0 = osc.order_parameter()
-    print(f"  Sākums: R={R0:.3f}, Q_joy={q_joy(osc):.3f}")
+    Q0 = q_joy(osc)
+    print(f"  Sākums: R={R0:.4f}, Q_joy={Q0:.4f}")
 
-    hist = osc.run(steps=500, dt=0.02)
+    # Sinhronizācijas cikls
+    hist = osc.run(steps=300, dt=0.02)
     R1, Psi1 = osc.order_parameter()
-    print(f"  Pēc 500 soļiem: R={R1:.3f}, Q_joy={q_joy(osc):.3f}")
+    Q1 = q_joy(osc)
+    print(f"  Pēc 300 soļiem: R={R1:.4f}, Q_joy={Q1:.4f}")
+    print()
 
-    # FFT rezonances tests
+    # ── B) Mācīšanās demonstrācija ────────────────────────
+    print("▸ B) Rezonanses Plastiskums — Mācīšanās demonstrācija")
+    print("-" * 50)
+    print("  Izpildīsim 5 mācīšanās ciklus ar augstu Q_joy...")
+    print()
+
+    for cycle in range(1, 6):
+        # Atjauno fāzes (bet saglabā K_matrix!)
+        osc.reset(seed=cycle * 10, reset_matrix=False)
+
+        # Sinhronizē
+        osc.run(steps=200, dt=0.02)
+        R, Psi = osc.order_parameter()
+        Q = q_joy(osc)
+
+        # Mācīšanās ar pašreizējo Q_joy
+        delta_K = osc.learn(Q, learning_rate=0.15, apply_decay=True)
+
+        # Progresa atskaite
+        mean_K = osc.coupling_strength()
+        var_K = osc.coupling_variance()
+        max_delta = np.max(np.abs(delta_K))
+
+        print(f"  Cikls {cycle}: R={R:.4f}, Q_joy={Q:+.4f} | "
+              f"K̄={mean_K:.4f}, var={var_K:.6f}, |ΔK|_max={max_delta:.4f}")
+
+    print()
+
+    # ── C) Stiprākās saites ───────────────────────────────
+    print("▸ C) Stiprākās saites pēc mācīšanās")
+    print("-" * 50)
+    top_connections = osc.strongest_connections(top_n=5)
+    for i, j, K_ij in top_connections:
+        harm_i = BASE_HARMONICS[i] if i < len(BASE_HARMONICS) else i
+        harm_j = BASE_HARMONICS[j] if j < len(BASE_HARMONICS) else j
+        print(f"  n={harm_i:.0f} ↔ n={harm_j:.0f} : K={K_ij:.4f}")
+    print()
+
+    # ── D) K_matrix vizualizācija (teksta) ────────────────
+    print("▸ D) K_matrix (simetriska sakabes matrica)")
+    print("-" * 50)
+    print("      ", end="")
+    for j in range(osc.n_oscillators):
+        print(f"  n={BASE_HARMONICS[j]:.0f}  ", end="")
+    print()
+    for i in range(osc.n_oscillators):
+        print(f"  n={BASE_HARMONICS[i]:.0f}", end=" ")
+        for j in range(osc.n_oscillators):
+            K_ij = osc.K_matrix[i, j]
+            if i == j:
+                print("    -   ", end="")
+            else:
+                print(f"  {K_ij:.3f} ", end="")
+        print()
+    print()
+
+    # ── E) Atmiņas saglabāšana ────────────────────────────
+    print("▸ E) Atmiņas saglabāšana un ielāde")
+    print("-" * 50)
+    memory_path = osc.save_memory("phaseflow_memory.npz")
+    print(f"  Atmiņa saglabāta: {memory_path}")
+
+    # Izveido jaunu oscilatoru un ielādē atmiņu
+    osc_new = KuramotoOscillator(K=2.0, use_matrix=True, seed=999)
+    print(f"  Jauns oscilators (pirms ielādes): K̄={osc_new.coupling_strength():.4f}")
+
+    loaded = osc_new.load_memory("phaseflow_memory.npz")
+    print(f"  Pēc atmiņas ielādes: K̄={osc_new.coupling_strength():.4f}")
+    print(f"  Mācīšanās vēsture: {len(osc_new.learning_history)} cikli")
+    print()
+
+    # ── F) Salīdzinājums: ar/bez mācīšanās ────────────────
+    print("▸ F) Salīdzinājums: sinhronizācijas ātrums")
+    print("-" * 50)
+
+    # Bez mācīšanās (svaiga matrica)
+    osc_fresh = KuramotoOscillator(K=2.0, use_matrix=True, seed=123)
+    steps_to_sync_fresh = 0
+    for s in range(500):
+        osc_fresh.step(0.02)
+        R, _ = osc_fresh.order_parameter()
+        if R > 0.7:
+            steps_to_sync_fresh = s
+            break
+
+    # Ar mācīšanos (ielādēta atmiņa)
+    osc_learned = KuramotoOscillator(K=2.0, use_matrix=True, seed=123)
+    osc_learned.load_memory("phaseflow_memory.npz")
+    steps_to_sync_learned = 0
+    for s in range(500):
+        osc_learned.step(0.02)
+        R, _ = osc_learned.order_parameter()
+        if R > 0.7:
+            steps_to_sync_learned = s
+            break
+
+    print(f"  Bez mācīšanās: R>0.7 pēc {steps_to_sync_fresh} soļiem")
+    print(f"  Ar mācīšanos:  R>0.7 pēc {steps_to_sync_learned} soļiem")
+    if steps_to_sync_learned < steps_to_sync_fresh:
+        speedup = (steps_to_sync_fresh - steps_to_sync_learned) / max(steps_to_sync_fresh, 1) * 100
+        print(f"  💡 Ātrums pieauga par {speedup:.1f}%!")
+    print()
+
+    # ── G) FFT tests ──────────────────────────────────────
+    print("▸ G) FFT rezonanses tests")
+    print("-" * 50)
     t = np.linspace(0, 10, 1024)
     test_signal = (np.sin(2 * np.pi * 1.0 * t) +
                    np.sin(2 * np.pi * 3.0 * t) * 0.7 +
                    np.sin(2 * np.pi * 9.0 * t) * 0.4)
     passed, score = resonance_gate(test_signal, sample_rate=1024 / 10)
-    print(f"\nRezonanses vārti: score={score:.4f}, iztur={passed}")
-    print("───────────────────────────────────────────")
+    print(f"  Rezonanses vārti: score={score:.4f}, iztur={passed}")
+
+    print()
+    print("═" * 60)
+    print("  PhaseFlow v1.1 — Rezonanses Plastiskums aktīvs")
+    print("  Sistēma tagad mācās caur Q_joy un atceras saites!")
+    print("═" * 60)
